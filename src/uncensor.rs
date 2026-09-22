@@ -59,7 +59,7 @@ static KNOWN_N: AtomicU64 = AtomicU64::new(0);
 // last full-scan duration (ms) and full-scan count; idle ticks skip the walk
 static SCAN_MS: AtomicU64 = AtomicU64::new(0);
 static SCANS: AtomicU64 = AtomicU64::new(0);
-static KNOWN: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
+static KNOWN: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
 // GObjects total seen by the last full scan (u32::MAX = none yet)
 static LAST_TOTAL: AtomicU64 = AtomicU64::new(u32::MAX as u64);
 // consecutive ticks with no usable Disable UFunction
@@ -405,6 +405,18 @@ pub fn tick(module: &Module) {
         }
         KNOWN_N.store(w as u64, Ordering::Relaxed);
         alive = w as u64;
+    }
+
+    if func != 0 {
+        let n = KNOWN_N.load(Ordering::Relaxed) as usize;
+        let mut k = 0usize;
+        while k < n && k < KNOWN.len() {
+            let p = KNOWN[k].load(Ordering::Relaxed);
+            if p != 0 && unsafe { call_disable(module, p, func) } {
+                CAM_CALLS.fetch_add(1, Ordering::Relaxed);
+            }
+            k += 1;
+        }
     }
 
     let last_total = LAST_TOTAL.load(Ordering::Relaxed);

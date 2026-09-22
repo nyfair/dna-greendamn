@@ -76,6 +76,7 @@ fn run() {
     b.push_str(" size=0x");
     b.push_hex(module.size as u64, 0);
     log_buf(&b);
+    log::line("uncensor build 2026-09-22e (unconditional re-assert)");
 
     let mut last_report = unsafe { ffi::GetTickCount64() };
 
