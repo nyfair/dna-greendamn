@@ -54,10 +54,6 @@ extern "system" fn worker_thread(_param: *mut c_void) -> ffi::DWORD {
     0
 }
 
-pub fn log_buf(b: &Buf) {
-    log::line(unsafe { core::str::from_utf8_unchecked(b.as_bytes()) });
-}
-
 fn run() {
     if !log::init() {
         return;
@@ -75,7 +71,7 @@ fn run() {
     b.push_hex(module.base as u64, 0);
     b.push_str(" size=0x");
     b.push_hex(module.size as u64, 0);
-    log_buf(&b);
+    log::log_buf(&b);
     log::line("uncensor build 2026-09-22e (unconditional re-assert)");
 
     let mut last_report = unsafe { ffi::GetTickCount64() };
@@ -98,7 +94,7 @@ fn run() {
             b.push_u64(uncensor::scans());
             b.push_str(", func ");
             b.push_str(if uncensor::func_ok() { "ok" } else { "MISSING" });
-            log_buf(&b);
+            log::log_buf(&b);
         }
 
         unsafe { ffi::Sleep(TICK_MS) };

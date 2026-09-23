@@ -361,7 +361,7 @@ fn log_camera(module: &Module, pool: usize, cam: usize) {
         b.push_str(" '");
         push_class_name(&mut b, module, pool, cam);
         b.push_byte(b'\'');
-        crate::log_buf(&b);
+        log::log_buf(&b);
     }
 }
 
