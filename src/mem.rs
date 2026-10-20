@@ -7,6 +7,14 @@ pub struct Module {
     pub size: usize,
 }
 
+pub const MAX_SECTIONS: usize = 24;
+
+#[derive(Clone, Copy)]
+pub struct Section {
+    pub start: usize,
+    pub len: usize,
+}
+
 impl Module {
     pub fn find(name: &[u8]) -> Option<Module> {
         let mut w = [0u16; 64];
@@ -27,6 +35,41 @@ impl Module {
         let base = h as usize;
         let size = unsafe { size_of_image(base)? };
         Some(Module { base, size })
+    }
+
+    pub fn writable_sections(&self, out: &mut [Section]) -> usize {
+        let mut n = 0usize;
+        unsafe {
+            let pe = self.base + *((self.base + 0x3C) as *const u32) as usize;
+            if *(pe as *const u32) != 0x0000_4550 {
+                return 0;
+            }
+            let count = *((pe + 6) as *const u16) as usize;
+            let opt_size = *((pe + 20) as *const u16) as usize;
+            let first = pe + 24 + opt_size;
+            let mut i = 0usize;
+            while i < count && n < out.len() {
+                let h = first + i * 40;
+                let vsize = *((h + 8) as *const u32) as usize;
+                let rva = *((h + 12) as *const u32) as usize;
+                let chars = *((h + 36) as *const u32);
+                i += 1;
+                if chars & 0x8000_0000 == 0 || vsize == 0 {
+                    continue;
+                }
+                let start = self.base + rva;
+                let mut len = vsize;
+                if start >= self.end() {
+                    continue;
+                }
+                if start + len > self.end() {
+                    len = self.end() - start;
+                }
+                out[n] = Section { start, len };
+                n += 1;
+            }
+        }
+        n
     }
 
     pub fn end(&self) -> usize {

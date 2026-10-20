@@ -6,25 +6,51 @@ use crate::ffi;
 use crate::log;
 use crate::mem::*;
 
-// Offsets::GNames
-const GNAMES_RVA: usize = 0x0747CDC0;
-// Offsets::GObjects
-const GOBJECTS_RVA: usize = 0x07127C80;
-// UObject::ProcessEvent vtable slot, Offsets::ProcessEventIdx
-const PROCESSEVENT_IDX: usize = 0x44;
-// TUObjectArray @ module + GOBJECTS_RVA.
-// OFF_OBJECTS (0x0), OFF_NUM_ELEMENTS (0x14), OFF_NUM_CHUNKS (0x1C),
-// ElementsPerChunk (0x10000), FUObjectItem size (0x18)
+// From CppSDK/SDK/Engine_classes.hpp.
+const OFF_WORLD_GI: usize = 0x1A8;   // UWorld::OwningGameInstance
+const OFF_GI_PLAYERS: usize = 0x38;  // UGameInstance::LocalPlayers
+const OFF_PLAYER_PC: usize = 0x30;   // UPlayer::PlayerController
+const OFF_PC_MANAGER: usize = 0x340; // APlayerController::PlayerCameraManager
+
+// TUObjectArray @ the discovered slot
 const OFF_OBJECTS: usize = 0x00;
+const OFF_MAX_ELEMENTS: usize = 0x10;
 const OFF_NUM_ELEMENTS: usize = 0x14;
+const OFF_MAX_CHUNKS: usize = 0x18;
 const OFF_NUM_CHUNKS: usize = 0x1C;
 const ELEMENTS_PER_CHUNK: u32 = 0x10000;
 const FUOBJECT_ITEM: usize = 0x18;
+const UA_MIN_ELEMENTS: u32 = 0x800;
+const UA_MIN_MAX_ELEMENTS: u32 = 0x1_0000;
+const UA_MIN_CHUNKS: u32 = 1;
+const UA_MAX_CHUNKS: u32 = 0x14;
+const UA_MIN_MAX_CHUNKS: u32 = 6;
+const UA_MAX_MAX_CHUNKS: u32 = 0x5FF;
+const UA_CHUNK_ALIGN: u32 = 0x10;
+const UA_MIN_PER_CHUNK: u32 = 0x8000;
+const UA_MAX_PER_CHUNK: u32 = 0x8_0000;
+const FNAME_BLOCKS_MAX: usize = 8192;
+const FNAME_BLOCK_BYTES_MAX: usize = 0x2_0000;
+// UObject::ProcessEvent vtable slot, Offsets::ProcessEventIdx
+const PROCESSEVENT_IDX: usize = 0x44;
+
+const SCAN_CHUNK: usize = 0x10000;
+const SCAN_EVERY_TRIES: u64 = 2;
+const SCAN_MIN_INTERVAL_MS: u64 = 5_000;
 // sanity cap: something is very wrong if the array claims more than this
 const MAX_ELEMENTS: u32 = 8_000_000;
+const MAX_CHUNKS: u32 = 0x1000;
 const CAM_CLASS: &[u8] = b"PlayerCameraComponent";
 const FUNC_CLASS: &[u8] = b"Function";
 const DISABLE_NAME: &[u8] = b"DisableCameraDither";
+
+static WORLD_SLOT: AtomicUsize = AtomicUsize::new(0);
+static GOBJECTS: AtomicUsize = AtomicUsize::new(0);
+static GNAMES: AtomicUsize = AtomicUsize::new(0);
+static RESOLVE_TRIES: AtomicU64 = AtomicU64::new(0);
+static NEXT_SCAN: AtomicU64 = AtomicU64::new(0);
+static CAM_EVER_LOGGED: AtomicUsize = AtomicUsize::new(0);
+
 // object header block
 const OBJ_BLOCK: usize = 0x28;
 // class tags
@@ -55,11 +81,14 @@ static NAME_TAG: [AtomicU64; 2048] = [const { AtomicU64::new(0) }; 2048];
 static FUNC: AtomicUsize = AtomicUsize::new(0);
 static CAM_CALLS: AtomicU64 = AtomicU64::new(0);
 static CAMS_LAST: AtomicU64 = AtomicU64::new(0);
+// raw count from the last full scan, for the log only
+static CAMS_SEEN: AtomicU64 = AtomicU64::new(0);
 static KNOWN_N: AtomicU64 = AtomicU64::new(0);
 // last full-scan duration (ms) and full-scan count; idle ticks skip the walk
 static SCAN_MS: AtomicU64 = AtomicU64::new(0);
 static SCANS: AtomicU64 = AtomicU64::new(0);
-static KNOWN: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
+static LAST_SCAN_MS: AtomicU64 = AtomicU64::new(0);
+static KNOWN: [AtomicUsize; 128] = [const { AtomicUsize::new(0) }; 128];
 // GObjects total seen by the last full scan (u32::MAX = none yet)
 static LAST_TOTAL: AtomicU64 = AtomicU64::new(u32::MAX as u64);
 // consecutive ticks with no usable Disable UFunction
@@ -70,7 +99,7 @@ pub fn cam_calls() -> u64 {
 }
 
 pub fn cams_last() -> u64 {
-    CAMS_LAST.load(Ordering::Relaxed)
+    CAMS_SEEN.load(Ordering::Relaxed)
 }
 
 pub fn known() -> u64 {
@@ -98,20 +127,300 @@ struct Described {
     name_id: u32,
 }
 
-fn count(base: usize) -> u32 {
-    match read_u32(base + GOBJECTS_RVA + OFF_NUM_ELEMENTS) {
+fn count(objects: usize) -> u32 {
+    if objects == 0 {
+        return 0;
+    }
+    match read_u32(objects + OFF_NUM_ELEMENTS) {
         Some(n) if n <= MAX_ELEMENTS => n,
         _ => 0,
     }
 }
 
-fn chunks_ptr(base: usize) -> usize {
-    let array = base + GOBJECTS_RVA;
-    match read_u32(array + OFF_NUM_CHUNKS) {
-        Some(n) if n > 0 && n <= 0x1000 => {}
+fn chunks_ptr(objects: usize) -> usize {
+    if objects == 0 {
+        return 0;
+    }
+    match read_u32(objects + OFF_NUM_CHUNKS) {
+        Some(n) if n > 0 && n <= MAX_CHUNKS => {}
         _ => return 0,
     }
-    read_u64(array + OFF_OBJECTS).unwrap_or(0) as usize
+    read_u64(objects + OFF_OBJECTS).unwrap_or(0) as usize
+}
+
+fn gobjects() -> usize {
+    GOBJECTS.load(Ordering::Relaxed)
+}
+
+fn gnames() -> usize {
+    GNAMES.load(Ordering::Relaxed)
+}
+
+fn valid_object(module: &Module, p: usize) -> bool {
+    p != 0 && p % 8 == 0 && read_u64(p).is_some_and(|v| module.contains(v as usize))
+}
+
+fn resolve_world(module: &Module, world: usize) -> bool {
+    if !valid_object(module, world) {
+        return false;
+    }
+    if read_u32(world + 0x08).is_some_and(|f| f & SKIP_FLAGS != 0) {
+        return false;
+    }
+    let gi = read_u64(world + OFF_WORLD_GI).unwrap_or(0) as usize;
+    if !valid_object(module, gi) {
+        return false;
+    }
+    let players = gi + OFF_GI_PLAYERS;
+    let data = read_u64(players).unwrap_or(0) as usize;
+    let count = read_u32(players + 0x08).unwrap_or(0);
+    if data == 0 || count == 0 || count > 32 {
+        return false;
+    }
+    let local_player = read_u64(data).unwrap_or(0) as usize;
+    if !valid_object(module, local_player) {
+        return false;
+    }
+    let controller = read_u64(local_player + OFF_PLAYER_PC).unwrap_or(0) as usize;
+    if !valid_object(module, controller) {
+        return false;
+    }
+    let manager = read_u64(controller + OFF_PC_MANAGER).unwrap_or(0) as usize;
+    valid_object(module, manager)
+}
+
+fn rd_u32(b: &[u8], i: usize) -> u32 {
+    u32::from_le_bytes(b[i..i + 4].try_into().unwrap())
+}
+
+fn rd_u64(b: &[u8], i: usize) -> u64 {
+    u64::from_le_bytes(b[i..i + 8].try_into().unwrap())
+}
+
+fn scan<F>(module: &Module, window: usize, mut test: F) -> Option<usize>
+where
+    F: FnMut(usize, &[u8], usize) -> bool,
+{
+    let mut sections = [Section { start: 0, len: 0 }; MAX_SECTIONS];
+    let n = module.writable_sections(&mut sections);
+    let mut buf = [0u8; SCAN_CHUNK];
+    let overlap = window - 8;
+    let mut s = 0usize;
+    while s < n {
+        let start = sections[s].start;
+        let len = sections[s].len;
+        let mut off = 0usize;
+        while off < len {
+            let left = len - off;
+            let want = if left < SCAN_CHUNK { left } else { SCAN_CHUNK };
+            let got = unsafe { read_raw(start + off, buf.as_mut_ptr(), want) };
+            let usable = if got < window { 0 } else { got & !7 };
+            let mut i = 0usize;
+            while i + window <= usable {
+                if test(start + off + i, &buf, i) {
+                    return Some(start + off + i);
+                }
+                i += 8;
+            }
+            let step = if got == want && got > window {
+                got - overlap
+            } else if usable > window {
+                usable - overlap
+            } else {
+                want
+            };
+            off += step;
+        }
+        s += 1;
+    }
+    None
+}
+
+fn heapish(module: &Module, p: u64) -> bool {
+    p != 0 && p % 8 == 0 && p >= 0x1_0000 && !module.contains(p as usize)
+}
+
+fn discover_world(module: &Module) -> Option<usize> {
+    scan(module, 8, |_at, b, i| {
+        let v = rd_u64(b, i) as usize;
+        v != 0 && v % 8 == 0 && !module.contains(v) && resolve_world(module, v)
+    })
+}
+
+fn check_objects(b: &[u8], i: usize) -> bool {
+    let max = rd_u32(b, i + OFF_MAX_ELEMENTS);
+    let num = rd_u32(b, i + OFF_NUM_ELEMENTS);
+    let max_chunks = rd_u32(b, i + OFF_MAX_CHUNKS);
+    let num_chunks = rd_u32(b, i + OFF_NUM_CHUNKS);
+    if num <= UA_MIN_ELEMENTS || max <= UA_MIN_MAX_ELEMENTS || num > max {
+        return false;
+    }
+    if num_chunks < UA_MIN_CHUNKS || num_chunks > UA_MAX_CHUNKS {
+        return false;
+    }
+    if max_chunks < UA_MIN_MAX_CHUNKS || max_chunks > UA_MAX_MAX_CHUNKS || num_chunks > max_chunks {
+        return false;
+    }
+    if max % UA_CHUNK_ALIGN != 0 {
+        return false;
+    }
+    let per_chunk = max / max_chunks;
+    if per_chunk % UA_CHUNK_ALIGN != 0
+        || per_chunk < UA_MIN_PER_CHUNK
+        || per_chunk > UA_MAX_PER_CHUNK
+    {
+        return false;
+    }
+    if max / per_chunk != max_chunks {
+        return false;
+    }
+    (num / per_chunk) + 1 == num_chunks
+}
+
+fn objects_contain(a: usize, world: usize) -> bool {
+    let num = read_u32(a + OFF_NUM_ELEMENTS).unwrap_or(0);
+    let max = read_u32(a + OFF_MAX_ELEMENTS).unwrap_or(0);
+    let max_chunks = read_u32(a + OFF_MAX_CHUNKS).unwrap_or(0);
+    let num_chunks = read_u32(a + OFF_NUM_CHUNKS).unwrap_or(0);
+    if max_chunks == 0 {
+        return false;
+    }
+    let per_chunk = max / max_chunks;
+    if per_chunk == 0 {
+        return false;
+    }
+    let chunks = read_u64(a + OFF_OBJECTS).unwrap_or(0) as usize;
+    if chunks == 0 {
+        return false;
+    }
+    let mut c = 0u32;
+    while c < num_chunks {
+        if read_u64(chunks + c as usize * 8).unwrap_or(0) == 0 {
+            return false;
+        }
+        c += 1;
+    }
+    let mut i = 0u32;
+    while i < num {
+        let chunk = read_u64(chunks + (i / per_chunk) as usize * 8).unwrap_or(0) as usize;
+        if chunk == 0 {
+            return false;
+        }
+        let obj = read_u64(chunk + (i % per_chunk) as usize * FUOBJECT_ITEM).unwrap_or(0) as usize;
+        if obj == world {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn discover_objects(module: &Module, world: usize) -> Option<usize> {
+    scan(module, 0x20, |at, b, i| {
+        check_objects(b, i) && objects_contain(at, world)
+    })
+}
+
+fn names_world(pool: usize, world: usize) -> bool {
+    let class = read_u64(world + OFF_CLASS).unwrap_or(0) as usize;
+    if class == 0 {
+        return false;
+    }
+    let id = read_u32(class + OFF_NAME).unwrap_or(0);
+    let mut buf = [0u8; 8];
+    let n = read_fname(pool, id, &mut buf);
+    // Same two-character suffix tolerance the rest of the file uses, so a uniquified class name cannot disable the whole plugin.
+    n >= 5 && n <= 7 && &buf[..5] == b"World"
+}
+
+fn discover_names(module: &Module, world: usize) -> Option<usize> {
+    scan(module, 0x30, |at, b, i| {
+        if rd_u32(b, i) != 0 {
+            return false;
+        }
+        let cur_block = rd_u32(b, i + 0x08);
+        let cur_cursor = rd_u32(b, i + 0x0C);
+        if cur_block as usize >= FNAME_BLOCKS_MAX {
+            return false;
+        }
+        if cur_cursor < 0x10 || cur_cursor as usize >= FNAME_BLOCK_BYTES_MAX {
+            return false;
+        }
+        let mut k = 0usize;
+        while k < 4 {
+            if !heapish(module, rd_u64(b, i + POOL_BLOCKS + k * 8)) {
+                return false;
+            }
+            k += 1;
+        }
+        names_world(at, world)
+    })
+}
+
+fn resolve(module: &Module) -> bool {
+    if WORLD_SLOT.load(Ordering::Relaxed) != 0 && gobjects() != 0 && gnames() != 0 {
+        return true;
+    }
+    let tries = RESOLVE_TRIES.fetch_add(1, Ordering::Relaxed);
+    if tries < NEXT_SCAN.load(Ordering::Relaxed) {
+        return false;
+    }
+    NEXT_SCAN.store(tries + SCAN_EVERY_TRIES, Ordering::Relaxed);
+
+    if WORLD_SLOT.load(Ordering::Relaxed) == 0 {
+        match discover_world(module) {
+            Some(slot) => {
+                WORLD_SLOT.store(slot, Ordering::Relaxed);
+                log_global("GWorld slot", slot, module);
+            }
+            None => {
+                if tries == 0 {
+                    log::line("GWorld not found yet; the scan will retry");
+                }
+                return false;
+            }
+        }
+    }
+
+    let world = read_u64(WORLD_SLOT.load(Ordering::Relaxed)).unwrap_or(0) as usize;
+    if world == 0 {
+        return false;
+    }
+    if gobjects() == 0 {
+        match discover_objects(module, world) {
+            Some(a) => {
+                GOBJECTS.store(a, Ordering::Relaxed);
+                log_global("GObjects", a, module);
+            }
+            None => {
+                if tries == 0 {
+                    log::line("GObjects not found yet; the scan will retry");
+                }
+            }
+        }
+    }
+    if gnames() == 0 {
+        match discover_names(module, world) {
+            Some(a) => {
+                GNAMES.store(a, Ordering::Relaxed);
+                log_global("GNames", a, module);
+            }
+            None => {
+                if tries == 0 {
+                    log::line("GNames not found yet; the scan will retry");
+                }
+            }
+        }
+    }
+    gobjects() != 0 && gnames() != 0
+}
+
+fn log_global(label: &str, addr: usize, module: &Module) {
+    let mut b = Buf::new();
+    b.push_str(label);
+    b.push_str(" rva 0x");
+    b.push_hex(addr.wrapping_sub(module.base) as u64, 0);
+    log::log_buf(&b);
 }
 
 fn chunk_at(chunks: usize, chunk_idx: u32) -> usize {
@@ -210,7 +519,6 @@ fn class_of(obj: usize) -> usize {
     read_u64(obj + OFF_CLASS).unwrap_or(0) as usize
 }
 
-/// appends the class name of `obj` (`?` when it cannot be resolved)
 fn push_class_name(b: &mut Buf, module: &Module, pool: usize, obj: usize) {
     let mut buf = [0u8; MAX_NAME];
     let len = class_name(module, pool, obj, &mut buf);
@@ -221,7 +529,6 @@ fn push_class_name(b: &mut Buf, module: &Module, pool: usize, obj: usize) {
     }
 }
 
-/// validate one object and resolve its class tag (cached). None = dead/skip.
 fn describe(module: &Module, pool: usize, obj: usize) -> Option<Described> {
     let mut blk = [0u8; OBJ_BLOCK];
     if unsafe { read_raw(obj, blk.as_mut_ptr(), blk.len()) } != blk.len() {
@@ -246,7 +553,6 @@ fn describe(module: &Module, pool: usize, obj: usize) -> Option<Described> {
     let class_tag = if CLASS_OK[idx].load(Ordering::Relaxed) == want_a {
         (CLASS_TAG[idx].load(Ordering::Relaxed) & 0x3) as u32
     } else {
-        // class lives on the heap, but its vtable must sit in the game image
         match read_u64(class) {
             Some(v) if v != 0 && module.contains(v as usize) => {}
             _ => return None,
@@ -278,7 +584,6 @@ fn describe(module: &Module, pool: usize, obj: usize) -> Option<Described> {
     })
 }
 
-/// object-name tag for Function objects (cached by FName id).
 fn name_tag(pool: usize, name_id: u32) -> u32 {
     let idx = cache_idx(name_id as usize);
     let v = NAME_TAG[idx].load(Ordering::Relaxed);
@@ -328,7 +633,6 @@ unsafe fn call_disable(module: &Module, cam: usize, func: usize) -> bool {
     true
 }
 
-/// returns true when the camera was newly added
 fn remember_cam(cam: usize) -> bool {
     let n = KNOWN_N.load(Ordering::Relaxed) as usize;
     let mut i = 0usize;
@@ -350,9 +654,6 @@ fn remember_cam(cam: usize) -> bool {
     true
 }
 
-// the first live camera is logged once for sanity.
-static CAM_EVER_LOGGED: AtomicUsize = AtomicUsize::new(0);
-
 fn log_camera(module: &Module, pool: usize, cam: usize) {
     if CAM_EVER_LOGGED.swap(1, Ordering::Relaxed) == 0 {
         let mut b = Buf::new();
@@ -365,10 +666,12 @@ fn log_camera(module: &Module, pool: usize, cam: usize) {
     }
 }
 
-/// Cheap per-tick check: detect whether anything could have changed and only then pay for a full GObjects walk.
 pub fn tick(module: &Module) {
-    let pool = module.base + GNAMES_RVA;
-    let total = count(module.base);
+    if !resolve(module) {
+        return;
+    }
+    let pool = gnames();
+    let total = count(gobjects());
 
     // revalidate the cached Disable UFunction
     let mut func = FUNC.load(Ordering::Relaxed);
@@ -393,7 +696,8 @@ pub fn tick(module: &Module) {
         let mut k = 0usize;
         while k < n {
             let p = KNOWN[k].load(Ordering::Relaxed);
-            if p != 0 && describe(module, pool, p).is_some_and(|d| d.class_tag == TAG_CAM) {
+            // looks_alive rejects reused objects whose class/name bytes still read back as a camera but whose vtable was overwritten.
+            if p != 0 && valid_object(module, p) && describe(module, pool, p).is_some_and(|d| d.class_tag == TAG_CAM) {
                 KNOWN[w].store(p, Ordering::Relaxed);
                 w += 1;
             }
@@ -420,11 +724,6 @@ pub fn tick(module: &Module) {
     }
 
     let last_total = LAST_TOTAL.load(Ordering::Relaxed);
-    // full scan when
-    // 1. never scanned
-    // 2. GObjects grew/shrank (map change, streaming, level load)
-    // 3. a known camera died
-    // 4. the Disable UFunction has been missing for a while.
     let need = last_total == u32::MAX as u64
         || total != last_total as u32
         || alive != CAMS_LAST.load(Ordering::Relaxed)
@@ -432,17 +731,23 @@ pub fn tick(module: &Module) {
     if !need {
         return;
     }
+    let now = unsafe { ffi::GetTickCount64() };
+    let last = LAST_SCAN_MS.load(Ordering::Relaxed);
+    if last != 0 && now.wrapping_sub(last) < SCAN_MIN_INTERVAL_MS {
+        return;
+    }
+    LAST_SCAN_MS.store(now, Ordering::Relaxed);
     full_scan(module, pool, func);
 }
 
-/// Full GObjects walk: (re)acquire the Disable UFunction, disable every live camera, record the new baseline.
 fn full_scan(module: &Module, pool: usize, mut func: usize) {
     let t0 = unsafe { ffi::GetTickCount64() };
-    let chunks = chunks_ptr(module.base);
-    let total = count(module.base);
+    let chunks = chunks_ptr(gobjects());
+    let total = count(gobjects());
     if chunks == 0 || total == 0 {
         return;
     }
+    KNOWN_N.store(0, Ordering::Relaxed);
 
     let mut chunk_idx = u32::MAX;
     let mut chunk = 0usize;
@@ -486,7 +791,8 @@ fn full_scan(module: &Module, pool: usize, mut func: usize) {
 
     LAST_TOTAL.store(total as u64, Ordering::Relaxed);
     FUNC_STALE.store(if func == 0 { u32::MAX as u64 } else { 0 }, Ordering::Relaxed);
-    CAMS_LAST.store(cams, Ordering::Relaxed);
+    CAMS_SEEN.store(cams, Ordering::Relaxed);
+    CAMS_LAST.store(KNOWN_N.load(Ordering::Relaxed), Ordering::Relaxed);
     SCANS.fetch_add(1, Ordering::Relaxed);
     SCAN_MS.store(unsafe { ffi::GetTickCount64() }.wrapping_sub(t0), Ordering::Relaxed);
 }
