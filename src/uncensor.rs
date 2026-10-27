@@ -1,3 +1,4 @@
+use core::cmp::min;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -6,14 +7,21 @@ use crate::ffi;
 use crate::log;
 use crate::mem::*;
 
-// From CppSDK/SDK/Engine_classes.hpp.
-const OFF_WORLD_GI: usize = 0x1A8;   // UWorld::OwningGameInstance
-const OFF_GI_PLAYERS: usize = 0x38;  // UGameInstance::LocalPlayers
-const OFF_PLAYER_PC: usize = 0x30;   // UPlayer::PlayerController
-const OFF_PC_MANAGER: usize = 0x340; // APlayerController::PlayerCameraManager
+// From the dumper-7 CppSDK dump (CppSDK/SDK/Engine_classes.hpp).
+// UWorld::OwningGameInstance
+const OFF_WORLD_GI: usize = 0x1A8;
+// UGameInstance::LocalPlayers
+const OFF_GI_PLAYERS: usize = 0x38;
+// UPlayer::PlayerController
+const OFF_PLAYER_PC: usize = 0x30;
+// APlayerController::PlayerCameraManager
+const OFF_PC_MANAGER: usize = 0x340;
+// TArray<UPlayer*>: Data @ +0x00, Num @ +0x08
+const OFF_TARRAY_NUM: usize = 0x08;
+// Offsets::ProcessEventIdx
+const PROCESSEVENT_IDX: usize = 0x44;
 
-// TUObjectArray @ the discovered slot
-const OFF_OBJECTS: usize = 0x00;
+// ---- object / array / FName ----
 const OFF_MAX_ELEMENTS: usize = 0x10;
 const OFF_NUM_ELEMENTS: usize = 0x14;
 const OFF_MAX_CHUNKS: usize = 0x18;
@@ -31,28 +39,27 @@ const UA_MIN_PER_CHUNK: u32 = 0x8000;
 const UA_MAX_PER_CHUNK: u32 = 0x8_0000;
 const FNAME_BLOCKS_MAX: usize = 8192;
 const FNAME_BLOCK_BYTES_MAX: usize = 0x2_0000;
-// UObject::ProcessEvent vtable slot, Offsets::ProcessEventIdx
-const PROCESSEVENT_IDX: usize = 0x44;
 
-const SCAN_CHUNK: usize = 0x10000;
-const SCAN_EVERY_TRIES: u64 = 2;
-const SCAN_MIN_INTERVAL_MS: u64 = 5_000;
-// sanity cap: something is very wrong if the array claims more than this
-const MAX_ELEMENTS: u32 = 8_000_000;
-const MAX_CHUNKS: u32 = 0x1000;
+// object header block
+const OBJ_BLOCK: usize = 0x28;
+// UE object header: VTable(0x00) ObjectFlags(0x08) InternalIndex(0x0C) Class(0x10) Name(0x18)
+const OFF_FLAGS: usize = 0x08;
+const OFF_CLASS: usize = 0x10;
+const OFF_NAME: usize = 0x18;
+// RF_ClassDefaultObject(0x10) | RF_ArchetypeObject(0x20): never live instances
+const RF_CDO_OR_ARCHETYPE: u32 = 0x10 | 0x20;
+const RF_DESTROYED: u32 = 0x8000 | 0x10000;
+
+const POOL_BLOCKS: usize = 0x10;
+const BLOCK_SHIFT: u32 = 16;
+const BLOCK_MASK: u32 = 0xFFFF;
+const ENTRY_HEADER: usize = 2;
+const MAX_NAME: usize = 64;
+
 const CAM_CLASS: &[u8] = b"PlayerCameraComponent";
 const FUNC_CLASS: &[u8] = b"Function";
 const DISABLE_NAME: &[u8] = b"DisableCameraDither";
 
-static WORLD_SLOT: AtomicUsize = AtomicUsize::new(0);
-static GOBJECTS: AtomicUsize = AtomicUsize::new(0);
-static GNAMES: AtomicUsize = AtomicUsize::new(0);
-static RESOLVE_TRIES: AtomicU64 = AtomicU64::new(0);
-static NEXT_SCAN: AtomicU64 = AtomicU64::new(0);
-static CAM_EVER_LOGGED: AtomicUsize = AtomicUsize::new(0);
-
-// object header block
-const OBJ_BLOCK: usize = 0x28;
 // class tags
 const TAG_OTHER: u32 = 0;
 const TAG_CAM: u32 = 1;
@@ -61,24 +68,27 @@ const TAG_FUNC: u32 = 2;
 const TAG_DISABLE: u32 = 1;
 // direct-mapped caches (2048 slots)
 const CACHE_MASK: usize = 0x7FF;
-// UE object header: VTable(0x00) ObjectFlags(0x08) InternalIndex(0x0C) Class(0x10) Name(0x18)
-const OFF_CLASS: usize = 0x10;
-const OFF_NAME: usize = 0x18;
-// RF_ClassDefaultObject(0x10) | RF_ArchetypeObject(0x20): never live instances
-const SKIP_FLAGS: u32 = 0x30;
-const POOL_BLOCKS: usize = 0x10;
-const BLOCK_SHIFT: u32 = 16;
-const BLOCK_MASK: u32 = 0xFFFF;
-const ENTRY_HEADER: usize = 2;
-const MAX_NAME: usize = 64;
 
+const SCAN_CHUNK: usize = 0x10000;
+// sanity cap: something is very wrong if the array claims more than this
+const MAX_ELEMENTS: u32 = 8_000_000;
+const MAX_CHUNKS: u32 = 0x1000;
+
+static WORLD_SLOT: AtomicUsize = AtomicUsize::new(0);
+static GOBJECTS: AtomicUsize = AtomicUsize::new(0);
+static GNAMES: AtomicUsize = AtomicUsize::new(0);
+static RESOLVE_TRIES: AtomicU64 = AtomicU64::new(0);
+static NEXT_SCAN: AtomicU64 = AtomicU64::new(0);
 // class-ptr -> validity (slot = class | 1 when the class vtable is in-module)
 static CLASS_OK: [AtomicU64; 2048] = [const { AtomicU64::new(0) }; 2048];
 // class-ptr -> class tag, parallel to CLASS_OK
 static CLASS_TAG: [AtomicU64; 2048] = [const { AtomicU64::new(0) }; 2048];
 // FName id -> object-name tag (slot = valid | tag<<1 | key<<32)
 static NAME_TAG: [AtomicU64; 2048] = [const { AtomicU64::new(0) }; 2048];
+
+static CUR_MANAGER: AtomicUsize = AtomicUsize::new(0);
 static FUNC: AtomicUsize = AtomicUsize::new(0);
+static CAM_EVER_LOGGED: AtomicUsize = AtomicUsize::new(0);
 static CAM_CALLS: AtomicU64 = AtomicU64::new(0);
 static CAMS_LAST: AtomicU64 = AtomicU64::new(0);
 // raw count from the last full scan, for the log only
@@ -87,44 +97,19 @@ static KNOWN_N: AtomicU64 = AtomicU64::new(0);
 // last full-scan duration (ms) and full-scan count; idle ticks skip the walk
 static SCAN_MS: AtomicU64 = AtomicU64::new(0);
 static SCANS: AtomicU64 = AtomicU64::new(0);
-static LAST_SCAN_MS: AtomicU64 = AtomicU64::new(0);
 static KNOWN: [AtomicUsize; 128] = [const { AtomicUsize::new(0) }; 128];
 // GObjects total seen by the last full scan (u32::MAX = none yet)
 static LAST_TOTAL: AtomicU64 = AtomicU64::new(u32::MAX as u64);
 // consecutive ticks with no usable Disable UFunction
 static FUNC_STALE: AtomicU64 = AtomicU64::new(0);
 
-pub fn cam_calls() -> u64 {
-    CAM_CALLS.load(Ordering::Relaxed)
-}
-
-pub fn cams_last() -> u64 {
-    CAMS_SEEN.load(Ordering::Relaxed)
-}
-
-pub fn known() -> u64 {
-    KNOWN_N.load(Ordering::Relaxed)
-}
-
-pub fn walk_ms() -> u64 {
-    SCAN_MS.load(Ordering::Relaxed)
-}
-
-pub fn scans() -> u64 {
-    SCANS.load(Ordering::Relaxed)
-}
-
-pub fn func_ok() -> bool {
-    FUNC.load(Ordering::Relaxed) != 0
+struct Described {
+    class_tag: u32,
+    name_id: u32,
 }
 
 fn cache_idx(key: usize) -> usize {
     key & CACHE_MASK
-}
-
-struct Described {
-    class_tag: u32,
-    name_id: u32,
 }
 
 fn count(objects: usize) -> u32 {
@@ -145,7 +130,7 @@ fn chunks_ptr(objects: usize) -> usize {
         Some(n) if n > 0 && n <= MAX_CHUNKS => {}
         _ => return 0,
     }
-    read_u64(objects + OFF_OBJECTS).unwrap_or(0) as usize
+    read_u64(objects).unwrap_or(0) as usize
 }
 
 fn gobjects() -> usize {
@@ -156,37 +141,99 @@ fn gnames() -> usize {
     GNAMES.load(Ordering::Relaxed)
 }
 
-fn valid_object(module: &Module, p: usize) -> bool {
-    p != 0 && p % 8 == 0 && read_u64(p).is_some_and(|v| module.contains(v as usize))
+fn is_destroyed(obj: usize) -> bool {
+    matches!(read_u32(obj + OFF_FLAGS), Some(f) if f & RF_DESTROYED != 0)
 }
 
-fn resolve_world(module: &Module, world: usize) -> bool {
-    if !valid_object(module, world) {
-        return false;
+fn valid_object(module: &Module, obj: usize) -> bool {
+    obj != 0 && obj % 8 == 0 && read_u64(obj).is_some_and(|v| module.contains(v as usize)) && !is_destroyed(obj)
+}
+
+fn is_cdo_or_archetype(obj: usize) -> bool {
+    matches!(read_u32(obj + 0x08), Some(f) if f & RF_CDO_OR_ARCHETYPE != 0)
+}
+
+fn array(addr: usize, limit: u32) -> Option<(usize, u32)> {
+    let data = read_u64(addr)? as usize;
+    let num = read_u32(addr + OFF_TARRAY_NUM)?;
+    if data == 0 || num == 0 || num > limit {
+        return None;
     }
-    if read_u32(world + 0x08).is_some_and(|f| f & SKIP_FLAGS != 0) {
-        return false;
+    Some((data, num))
+}
+
+fn chunk_at(chunks: usize, chunk_idx: u32) -> usize {
+    if chunks == 0 {
+        return 0;
     }
-    let gi = read_u64(world + OFF_WORLD_GI).unwrap_or(0) as usize;
-    if !valid_object(module, gi) {
-        return false;
+    read_u64(chunks + chunk_idx as usize * 8).unwrap_or(0) as usize
+}
+
+fn item_at(chunk: usize, index: u32) -> usize {
+    if chunk == 0 {
+        return 0;
     }
-    let players = gi + OFF_GI_PLAYERS;
-    let data = read_u64(players).unwrap_or(0) as usize;
-    let count = read_u32(players + 0x08).unwrap_or(0);
-    if data == 0 || count == 0 || count > 32 {
-        return false;
+    read_u64(chunk + (index % ELEMENTS_PER_CHUNK) as usize * FUOBJECT_ITEM).unwrap_or(0) as usize
+}
+
+fn matches(src: &[u8], tgt: &[u8]) -> bool {
+    if src.len() == tgt.len() {
+        return src == tgt;
     }
-    let local_player = read_u64(data).unwrap_or(0) as usize;
-    if !valid_object(module, local_player) {
-        return false;
+    if src.len() > tgt.len() && src.len() - tgt.len() <= 2 {
+        return &src[..tgt.len()] == tgt;
     }
-    let controller = read_u64(local_player + OFF_PLAYER_PC).unwrap_or(0) as usize;
-    if !valid_object(module, controller) {
-        return false;
+    false
+}
+
+fn read_fname(pool: usize, id: u32, out: &mut [u8]) -> usize {
+    let block = match read_u64(pool + POOL_BLOCKS + ((id >> BLOCK_SHIFT) as usize) * 8) {
+        Some(v) if v != 0 => v as usize,
+        _ => return 0,
+    };
+    let entry = block + (id & BLOCK_MASK) as usize * 2;
+    let h = match read_u16(entry) {
+        Some(v) => v,
+        None => return 0,
+    };
+    let mut len = (h >> 1) as usize;
+    let wide = (h & 1) != 0;
+    if len == 0 {
+        return 0;
     }
-    let manager = read_u64(controller + OFF_PC_MANAGER).unwrap_or(0) as usize;
-    valid_object(module, manager)
+    if len > MAX_NAME {
+        len = MAX_NAME;
+    }
+    let limit = min(out.len(), len);
+    let mut buf = [0u8; MAX_NAME * 2];
+    let want = min(if wide { limit * 2 } else { limit }, buf.len());
+    let got = unsafe { read_raw(entry + ENTRY_HEADER, buf.as_mut_ptr(), want) };
+    let mut n = 0usize;
+    if wide {
+        let mut i = 0usize;
+        while i + 1 < got && n < limit {
+            if buf[i + 1] != 0 {
+                break;
+            }
+            let c = buf[i];
+            if !(0x20..0x7f).contains(&c) {
+                break;
+            }
+            out[n] = c;
+            n += 1;
+            i += 2;
+        }
+    } else {
+        while n < limit && n < got {
+            let c = buf[n];
+            if !(0x20..0x7f).contains(&c) {
+                break;
+            }
+            out[n] = c;
+            n += 1;
+        }
+    }
+    n
 }
 
 fn rd_u32(b: &[u8], i: usize) -> u32 {
@@ -240,10 +287,49 @@ fn heapish(module: &Module, p: u64) -> bool {
     p != 0 && p % 8 == 0 && p >= 0x1_0000 && !module.contains(p as usize)
 }
 
-fn discover_world(module: &Module) -> Option<usize> {
+/// Walks World -> GameInstance -> LocalPlayers -> PlayerController -> PlayerCameraManager.
+/// None when any link is missing, not an object, or a CDO/archetype.
+fn resolve_world(module: &Module, world: usize) -> Option<(usize, usize)> {
+    if world == 0 || !valid_object(module, world) || is_cdo_or_archetype(world) {
+        return None;
+    }
+    let gi = read_u64(world + OFF_WORLD_GI).unwrap_or(0) as usize;
+    if gi == 0 || !valid_object(module, gi) {
+        return None;
+    }
+    let (data, _num) = array(gi + OFF_GI_PLAYERS, 32)?;
+    let lp = read_u64(data).unwrap_or(0) as usize;
+    if lp == 0 || !valid_object(module, lp) {
+        return None;
+    }
+    let pc = read_u64(lp + OFF_PLAYER_PC).unwrap_or(0) as usize;
+    if pc == 0 || !valid_object(module, pc) {
+        return None;
+    }
+    let mgr = read_u64(pc + OFF_PC_MANAGER).unwrap_or(0) as usize;
+    if mgr == 0 || !valid_object(module, mgr) {
+        return None;
+    }
+    Some((pc, mgr))
+}
+
+/// Resolve the current camera manager through the controller chain. None while loading / between worlds.
+fn resolve_manager(module: &Module) -> Option<usize> {
+    let slot = WORLD_SLOT.load(Ordering::Acquire);
+    if slot == 0 || !module.contains(slot) {
+        return None;
+    }
+    let world = read_u64(slot)? as usize;
+    resolve_world(module, world).map(|w| w.1)
+}
+
+fn discover_gworld(module: &Module) -> Option<usize> {
     scan(module, 8, |_at, b, i| {
-        let v = rd_u64(b, i) as usize;
-        v != 0 && v % 8 == 0 && !module.contains(v) && resolve_world(module, v)
+        let world = rd_u64(b, i) as usize;
+        world != 0
+            && (world & 7) == 0
+            && !module.contains(world)
+            && resolve_world(module, world).is_some()
     })
 }
 
@@ -289,7 +375,7 @@ fn objects_contain(a: usize, world: usize) -> bool {
     if per_chunk == 0 {
         return false;
     }
-    let chunks = read_u64(a + OFF_OBJECTS).unwrap_or(0) as usize;
+    let chunks = read_u64(a).unwrap_or(0) as usize;
     if chunks == 0 {
         return false;
     }
@@ -357,7 +443,8 @@ fn discover_names(module: &Module, world: usize) -> Option<usize> {
     })
 }
 
-fn resolve(module: &Module) -> bool {
+/// Finds the GWorld slot, GObjects and GNames, retrying a few ticks apart.
+fn ensure_globals(module: &Module) -> bool {
     if WORLD_SLOT.load(Ordering::Relaxed) != 0 && gobjects() != 0 && gnames() != 0 {
         return true;
     }
@@ -365,13 +452,15 @@ fn resolve(module: &Module) -> bool {
     if tries < NEXT_SCAN.load(Ordering::Relaxed) {
         return false;
     }
-    NEXT_SCAN.store(tries + SCAN_EVERY_TRIES, Ordering::Relaxed);
+    // wait 4 ticks for next gworld scan
+    NEXT_SCAN.store(tries + 4, Ordering::Relaxed);
 
     if WORLD_SLOT.load(Ordering::Relaxed) == 0 {
-        match discover_world(module) {
+        match discover_gworld(module) {
             Some(slot) => {
                 WORLD_SLOT.store(slot, Ordering::Relaxed);
-                log_global("GWorld slot", slot, module);
+                let world = read_u64(slot).unwrap_or(0) as usize;
+                log_gworld(slot, world, module);
             }
             None => {
                 if tries == 0 {
@@ -423,110 +512,32 @@ fn log_global(label: &str, addr: usize, module: &Module) {
     log::log_buf(&b);
 }
 
-fn chunk_at(chunks: usize, chunk_idx: u32) -> usize {
-    if chunks == 0 {
-        return 0;
-    }
-    read_u64(chunks + chunk_idx as usize * 8).unwrap_or(0) as usize
+fn log_gworld(slot: usize, world: usize, module: &Module) {
+    let mut b = Buf::new();
+    b.push_str("GWorld slot 0x");
+    b.push_hex(slot as u64, 0);
+    b.push_str(" (RVA 0x");
+    b.push_hex(slot.wrapping_sub(module.base) as u64, 0);
+    b.push_str("), world 0x");
+    b.push_hex(world as u64, 0);
+    log::log_buf(&b);
 }
 
-fn item_at(chunk: usize, index: u32) -> usize {
-    if chunk == 0 {
-        return 0;
+fn name_tag(pool: usize, name_id: u32) -> u32 {
+    let idx = cache_idx(name_id as usize);
+    let v = NAME_TAG[idx].load(Ordering::Relaxed);
+    if v & 1 != 0 && ((v >> 32) as u32) == name_id {
+        return ((v >> 1) & 0x3) as u32;
     }
-    read_u64(chunk + (index % ELEMENTS_PER_CHUNK) as usize * FUOBJECT_ITEM).unwrap_or(0)
-        as usize
-}
-
-fn matches(src: &[u8], tgt: &[u8]) -> bool {
-    if src.len() == tgt.len() {
-        return src == tgt;
-    }
-    if src.len() > tgt.len() && src.len() - tgt.len() <= 2 {
-        return &src[..tgt.len()] == tgt;
-    }
-    false
-}
-
-fn read_fname(pool: usize, id: u32, out: &mut [u8]) -> usize {
-    let block = match read_u64(pool + POOL_BLOCKS + ((id >> BLOCK_SHIFT) as usize) * 8) {
-        Some(v) if v != 0 => v as usize,
-        _ => return 0,
-    };
-    let entry = block + (id & BLOCK_MASK) as usize * 2;
-    let h = match read_u16(entry) {
-        Some(v) => v,
-        None => return 0,
-    };
-    let mut len = (h >> 1) as usize;
-    let wide = (h & 1) != 0;
-    if len == 0 {
-        return 0;
-    }
-    if len > MAX_NAME {
-        len = MAX_NAME;
-    }
-    let limit = core::cmp::min(out.len(), len);
-    let mut buf = [0u8; MAX_NAME * 2];
-    let want = core::cmp::min(if wide { limit * 2 } else { limit }, buf.len());
-    let got = unsafe { read_raw(entry + ENTRY_HEADER, buf.as_mut_ptr(), want) };
-    let mut n = 0usize;
-    if wide {
-        let mut i = 0usize;
-        while i + 1 < got && n < limit {
-            if buf[i + 1] != 0 {
-                break;
-            }
-            let c = buf[i];
-            if !(0x20..0x7f).contains(&c) {
-                break;
-            }
-            out[n] = c;
-            n += 1;
-            i += 2;
-        }
-    } else {
-        while n < limit && n < got {
-            let c = buf[n];
-            if !(0x20..0x7f).contains(&c) {
-                break;
-            }
-            out[n] = c;
-            n += 1;
-        }
-    }
-    n
-}
-
-fn class_name(module: &Module, pool: usize, obj: usize, out: &mut [u8]) -> usize {
-    let class = class_of(obj);
-    if class == 0 {
-        return 0;
-    }
-    // a class lives on the heap, but its vtable has to sit inside the game image
-    match read_u64(class) {
-        Some(v) if module.contains(v as usize) => {}
-        _ => return 0,
-    }
-    let id = match read_u32(class + OFF_NAME) {
-        Some(v) => v,
-        None => return 0,
-    };
-    read_fname(pool, id, out)
-}
-
-fn class_of(obj: usize) -> usize {
-    read_u64(obj + OFF_CLASS).unwrap_or(0) as usize
-}
-
-fn push_class_name(b: &mut Buf, module: &Module, pool: usize, obj: usize) {
     let mut buf = [0u8; MAX_NAME];
-    let len = class_name(module, pool, obj, &mut buf);
-    if len == 0 {
-        b.push_byte(b'?');
+    let len = read_fname(pool, name_id, &mut buf);
+    let tag = if len > 0 && matches(&buf[..len], DISABLE_NAME) {
+        TAG_DISABLE
     } else {
-        b.push_bytes(&buf[..len]);
-    }
+        TAG_OTHER
+    };
+    NAME_TAG[idx].store(1 | ((tag as u64) << 1) | ((name_id as u64) << 32), Ordering::Relaxed);
+    tag
 }
 
 fn describe(module: &Module, pool: usize, obj: usize) -> Option<Described> {
@@ -539,7 +550,7 @@ fn describe(module: &Module, pool: usize, obj: usize) -> Option<Described> {
         return None;
     }
     let flags = u32::from_le_bytes(blk[8..12].try_into().ok()?);
-    if flags & SKIP_FLAGS != 0 {
+    if flags & RF_CDO_OR_ARCHETYPE != 0 {
         return None;
     }
     let class = u64::from_le_bytes(blk[0x10..0x18].try_into().ok()?) as usize;
@@ -584,21 +595,35 @@ fn describe(module: &Module, pool: usize, obj: usize) -> Option<Described> {
     })
 }
 
-fn name_tag(pool: usize, name_id: u32) -> u32 {
-    let idx = cache_idx(name_id as usize);
-    let v = NAME_TAG[idx].load(Ordering::Relaxed);
-    if v & 1 != 0 && ((v >> 32) as u32) == name_id {
-        return ((v >> 1) & 0x3) as u32;
+fn class_name(module: &Module, pool: usize, obj: usize, out: &mut [u8]) -> usize {
+    let class = class_of(obj);
+    if class == 0 {
+        return 0;
     }
-    let mut buf = [0u8; 64];
-    let len = read_fname(pool, name_id, &mut buf);
-    let tag = if len > 0 && matches(&buf[..len], DISABLE_NAME) {
-        TAG_DISABLE
-    } else {
-        TAG_OTHER
+    // a class lives on the heap, but its vtable has to sit inside the game image
+    match read_u64(class) {
+        Some(v) if module.contains(v as usize) => {}
+        _ => return 0,
+    }
+    let id = match read_u32(class + OFF_NAME) {
+        Some(v) => v,
+        None => return 0,
     };
-    NAME_TAG[idx].store(1 | ((tag as u64) << 1) | ((name_id as u64) << 32), Ordering::Relaxed);
-    tag
+    read_fname(pool, id, out)
+}
+
+fn class_of(obj: usize) -> usize {
+    read_u64(obj + OFF_CLASS).unwrap_or(0) as usize
+}
+
+fn push_class_name(b: &mut Buf, module: &Module, pool: usize, obj: usize) {
+    let mut buf = [0u8; MAX_NAME];
+    let len = class_name(module, pool, obj, &mut buf);
+    if len == 0 {
+        b.push_byte(b'?');
+    } else {
+        b.push_bytes(&buf[..len]);
+    }
 }
 
 fn is_disable_func(module: &Module, pool: usize, func: usize) -> bool {
@@ -667,11 +692,16 @@ fn log_camera(module: &Module, pool: usize, cam: usize) {
 }
 
 pub fn tick(module: &Module) {
-    if !resolve(module) {
+    if !ensure_globals(module) {
+        return;
+    }
+    let Some(mgr) = resolve_manager(module) else {
+        return;
+    };
+    if is_cdo_or_archetype(mgr) {
         return;
     }
     let pool = gnames();
-    let total = count(gobjects());
 
     // revalidate the cached Disable UFunction
     let mut func = FUNC.load(Ordering::Relaxed);
@@ -723,21 +753,19 @@ pub fn tick(module: &Module) {
         }
     }
 
-    let last_total = LAST_TOTAL.load(Ordering::Relaxed);
-    let need = last_total == u32::MAX as u64
-        || total != last_total as u32
+    let new_mgr = CUR_MANAGER.swap(mgr, Ordering::Relaxed) != mgr;
+    if new_mgr {
+        let mut b = Buf::new();
+        b.push_str("scene 0x");
+        b.push_hex(mgr as u64, 0);
+        log::log_buf(&b);
+    }
+    let need = new_mgr
         || alive != CAMS_LAST.load(Ordering::Relaxed)
         || (func == 0 && FUNC_STALE.load(Ordering::Relaxed) >= 4);
-    if !need {
-        return;
+    if need {
+        full_scan(module, pool, func);
     }
-    let now = unsafe { ffi::GetTickCount64() };
-    let last = LAST_SCAN_MS.load(Ordering::Relaxed);
-    if last != 0 && now.wrapping_sub(last) < SCAN_MIN_INTERVAL_MS {
-        return;
-    }
-    LAST_SCAN_MS.store(now, Ordering::Relaxed);
-    full_scan(module, pool, func);
 }
 
 fn full_scan(module: &Module, pool: usize, mut func: usize) {
@@ -795,4 +823,28 @@ fn full_scan(module: &Module, pool: usize, mut func: usize) {
     CAMS_LAST.store(KNOWN_N.load(Ordering::Relaxed), Ordering::Relaxed);
     SCANS.fetch_add(1, Ordering::Relaxed);
     SCAN_MS.store(unsafe { ffi::GetTickCount64() }.wrapping_sub(t0), Ordering::Relaxed);
+}
+
+pub fn walk_ms() -> u64 {
+    SCAN_MS.load(Ordering::Relaxed)
+}
+
+pub fn scans() -> u64 {
+    SCANS.load(Ordering::Relaxed)
+}
+
+pub fn cam_calls() -> u64 {
+    CAM_CALLS.load(Ordering::Relaxed)
+}
+
+pub fn cams_last() -> u64 {
+    CAMS_SEEN.load(Ordering::Relaxed)
+}
+
+pub fn known() -> u64 {
+    KNOWN_N.load(Ordering::Relaxed)
+}
+
+pub fn func_ok() -> bool {
+    FUNC.load(Ordering::Relaxed) != 0
 }

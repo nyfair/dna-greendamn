@@ -1,3 +1,6 @@
+// Kernel32 surface: each build only links the subset it actually calls.
+#![allow(dead_code)]
+
 use core::ffi::c_void;
 
 pub type BOOL = i32;
@@ -17,6 +20,7 @@ pub const FILE_SHARE_WRITE: DWORD = 0x0000_0002;
 pub const CREATE_ALWAYS: DWORD = 2;
 pub const FILE_ATTRIBUTE_NORMAL: DWORD = 0x80;
 pub const INVALID_HANDLE_VALUE: isize = -1;
+pub const PAGE_EXECUTE_READWRITE: DWORD = 0x40;
 pub const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: DWORD = 0x0000_0004;
 pub const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: DWORD = 0x0000_0002;
 
@@ -43,12 +47,23 @@ unsafe extern "system" {
     pub fn DisableThreadLibraryCalls(module: HINSTANCE) -> BOOL;
     pub fn Sleep(ms: DWORD);
 
+    pub fn VirtualProtect(addr: LPVOID, size: SIZE_T, new: DWORD, old: *mut DWORD) -> BOOL;
+    pub fn FlushInstructionCache(process: HANDLE, base: LPCVOID, size: SIZE_T) -> BOOL;
+
     pub fn ReadProcessMemory(
         process: HANDLE,
         base: LPCVOID,
         buffer: LPVOID,
         size: SIZE_T,
         read: *mut SIZE_T,
+    ) -> BOOL;
+
+    pub fn WriteProcessMemory(
+        process: HANDLE,
+        base: LPVOID,
+        buffer: LPCVOID,
+        size: SIZE_T,
+        written: *mut SIZE_T,
     ) -> BOOL;
 
     pub fn CreateThread(
@@ -81,5 +96,6 @@ unsafe extern "system" {
     pub fn GetLocalTime(out: *mut SystemTime);
 
     pub fn GetTickCount64() -> u64;
-}
 
+    pub fn GetCurrentThreadId() -> DWORD;
+}

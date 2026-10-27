@@ -1,3 +1,6 @@
+// Shared memory helpers: each build only references a subset of them.
+#![allow(dead_code)]
+
 use core::ffi::c_void;
 
 use crate::ffi;
@@ -16,19 +19,25 @@ pub struct Section {
 }
 
 impl Module {
+    /// Resolve a loaded module. An empty name resolves the host process image.
     pub fn find(name: &[u8]) -> Option<Module> {
         let mut w = [0u16; 64];
         if name.len() + 1 > w.len() {
             return None;
         }
-        let mut i = 0;
+        let mut i = 0usize;
         while i < name.len() {
             w[i] = name[i] as u16;
             i += 1;
         }
         w[name.len()] = 0;
 
-        let h = unsafe { ffi::GetModuleHandleW(w.as_ptr()) };
+        let name_ptr = if name.is_empty() {
+            core::ptr::null()
+        } else {
+            w.as_ptr()
+        };
+        let h = unsafe { ffi::GetModuleHandleW(name_ptr) };
         if h.is_null() {
             return None;
         }
@@ -37,6 +46,7 @@ impl Module {
         Some(Module { base, size })
     }
 
+    /// Sections flagged IMAGE_SCN_MEM_WRITE, clipped to SizeOfImage.
     pub fn writable_sections(&self, out: &mut [Section]) -> usize {
         let mut n = 0usize;
         unsafe {
@@ -116,6 +126,16 @@ pub unsafe fn read_raw(addr: usize, out: *mut u8, len: usize) -> usize {
     }
 }
 
+pub fn read_u8(addr: usize) -> Option<u8> {
+    let mut v: u8 = 0;
+    let got = unsafe { read_raw(addr, &mut v, 1) };
+    if got == 1 {
+        Some(v)
+    } else {
+        None
+    }
+}
+
 pub fn read_u16(addr: usize) -> Option<u16> {
     let mut v: u16 = 0;
     let got = unsafe { read_raw(addr, &mut v as *mut u16 as *mut u8, 2) };
@@ -144,4 +164,57 @@ pub fn read_u64(addr: usize) -> Option<u64> {
     } else {
         None
     }
+}
+
+pub fn read_f32(addr: usize) -> Option<f32> {
+    let mut v: f32 = 0.0;
+    let got = unsafe { read_raw(addr, &mut v as *mut f32 as *mut u8, 4) };
+    if got == 4 {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+pub fn read_f64(addr: usize) -> Option<f64> {
+    let mut v: f64 = 0.0;
+    let got = unsafe { read_raw(addr, &mut v as *mut f64 as *mut u8, 8) };
+    if got == 8 {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+pub fn write_bytes(addr: usize, data: &[u8]) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    let mut wrote: usize = 0;
+    let ok = unsafe {
+        ffi::WriteProcessMemory(
+            ffi::GetCurrentProcess(),
+            addr as *mut c_void,
+            data.as_ptr() as *const c_void,
+            data.len(),
+            &mut wrote,
+        )
+    };
+    ok != 0 && wrote == data.len()
+}
+
+pub fn write_u8(addr: usize, v: u8) -> bool {
+    write_bytes(addr, &[v])
+}
+
+pub fn write_u64(addr: usize, v: u64) -> bool {
+    write_bytes(addr, &v.to_ne_bytes())
+}
+
+pub fn write_f32(addr: usize, v: f32) -> bool {
+    write_bytes(addr, &v.to_ne_bytes())
+}
+
+pub fn write_f64(addr: usize, v: f64) -> bool {
+    write_bytes(addr, &v.to_ne_bytes())
 }

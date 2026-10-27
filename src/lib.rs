@@ -12,13 +12,19 @@ use core::panic::PanicInfo;
 
 use buf::Buf;
 
-const TARGET_MODULE: &[u8] = b"EM-Win64-Shipping.exe";
+const TARGET_NAME: &str = "EM-Win64-Shipping.exe";
+const PLUGIN_NAME: &str = "dna-greendamn";
+const BUILD: &str = "2026-10-20";
+const TARGET_MODULE: &[u8] = TARGET_NAME.as_bytes();
 const TICK_MS: u32 = 2_500;
 const HEARTBEAT_MS: u64 = 60_000;
 
 #[panic_handler]
 fn on_panic(_info: &PanicInfo) -> ! {
-    log::line("dna-greendamn panic!");
+    let mut b = Buf::new();
+    b.push_str(PLUGIN_NAME);
+    b.push_str(" panic!");
+    log::log_buf(&b);
     loop {
         unsafe { ffi::Sleep(HEARTBEAT_MS as u32) };
     }
@@ -61,18 +67,26 @@ fn run() {
     let module = match wait_for_module(TARGET_MODULE) {
         Some(m) => m,
         None => {
-            log::line("Not loaded by EM-Win64-Shipping.exe");
+            let mut b = Buf::new();
+            b.push_str("Not loaded by ");
+            b.push_str(TARGET_NAME);
+            log::log_buf(&b);
             return;
         }
     };
 
     let mut b = Buf::new();
-    b.push_str("EM-Win64-Shipping.exe @ 0x");
+    b.push_str(TARGET_NAME);
+    b.push_str(" @ 0x");
     b.push_hex(module.base as u64, 0);
     b.push_str(" size=0x");
     b.push_hex(module.size as u64, 0);
     log::log_buf(&b);
-    log::line("dna-greendamn build 2026-10-20");
+    let mut b = Buf::new();
+    b.push_str(PLUGIN_NAME);
+    b.push_str(" build ");
+    b.push_str(BUILD);
+    log::log_buf(&b);
 
     let mut last_report = unsafe { ffi::GetTickCount64() };
 
@@ -82,16 +96,16 @@ fn run() {
         if now.wrapping_sub(last_report) >= HEARTBEAT_MS {
             last_report = now;
             let mut b = Buf::new();
-            b.push_str("called ");
-            b.push_u64(uncensor::cam_calls());
-            b.push_str(" times, cameras ");
-            b.push_u64(uncensor::cams_last());
-            b.push_str(", known ");
-            b.push_u64(uncensor::known());
-            b.push_str(", walk ");
+            b.push_str("scan ");
             b.push_u64(uncensor::walk_ms());
             b.push_str("ms x");
             b.push_u64(uncensor::scans());
+            b.push_str(", calls ");
+            b.push_u64(uncensor::cam_calls());
+            b.push_str(", cameras ");
+            b.push_u64(uncensor::cams_last());
+            b.push_str(", known ");
+            b.push_u64(uncensor::known());
             b.push_str(", func ");
             b.push_str(if uncensor::func_ok() { "ok" } else { "MISSING" });
             log::log_buf(&b);
