@@ -100,8 +100,6 @@ static SCANS: AtomicU64 = AtomicU64::new(0);
 static KNOWN: [AtomicUsize; 128] = [const { AtomicUsize::new(0) }; 128];
 // GObjects total seen by the last full scan (u32::MAX = none yet)
 static LAST_TOTAL: AtomicU64 = AtomicU64::new(u32::MAX as u64);
-// consecutive ticks with no usable Disable UFunction
-static FUNC_STALE: AtomicU64 = AtomicU64::new(0);
 
 struct Described {
     class_tag: u32,
@@ -709,37 +707,28 @@ pub fn tick(module: &Module) {
         FUNC.store(0, Ordering::Relaxed);
         func = 0;
     }
-    if func == 0 {
-        FUNC_STALE.fetch_add(1, Ordering::Relaxed);
-    } else {
-        FUNC_STALE.store(0, Ordering::Relaxed);
-    }
 
-    // revalidate known cameras: drop the dead
-    let alive: u64;
-    {
-        let mut n = KNOWN_N.load(Ordering::Relaxed) as usize;
-        if n > KNOWN.len() {
-            n = KNOWN.len();
-        }
-        let mut w = 0usize;
-        let mut k = 0usize;
-        while k < n {
-            let p = KNOWN[k].load(Ordering::Relaxed);
-            // looks_alive rejects reused objects whose class/name bytes still read back as a camera but whose vtable was overwritten.
-            if p != 0 && valid_object(module, p) && describe(module, pool, p).is_some_and(|d| d.class_tag == TAG_CAM) {
-                KNOWN[w].store(p, Ordering::Relaxed);
-                w += 1;
-            }
-            k += 1;
-        }
-        while w < n {
-            KNOWN[w].store(0, Ordering::Relaxed);
+    let mut n = KNOWN_N.load(Ordering::Relaxed) as usize;
+    if n > KNOWN.len() {
+        n = KNOWN.len();
+    }
+    let mut w = 0usize;
+    let mut k = 0usize;
+    while k < n {
+        let p = KNOWN[k].load(Ordering::Relaxed);
+        // looks_alive rejects reused objects whose class/name
+        // bytes still read back as a camera but whose vtable was overwritten.
+        if p != 0 && valid_object(module, p) && describe(module, pool, p).is_some_and(|d| d.class_tag == TAG_CAM) {
+            KNOWN[w].store(p, Ordering::Relaxed);
             w += 1;
         }
-        KNOWN_N.store(w as u64, Ordering::Relaxed);
-        alive = w as u64;
+        k += 1;
     }
+    while w < n {
+        KNOWN[w].store(0, Ordering::Relaxed);
+        w += 1;
+    }
+    KNOWN_N.store(w as u64, Ordering::Relaxed);
 
     if func != 0 {
         let n = KNOWN_N.load(Ordering::Relaxed) as usize;
@@ -759,11 +748,6 @@ pub fn tick(module: &Module) {
         b.push_str("scene 0x");
         b.push_hex(mgr as u64, 0);
         log::log_buf(&b);
-    }
-    let need = new_mgr
-        || alive != CAMS_LAST.load(Ordering::Relaxed)
-        || (func == 0 && FUNC_STALE.load(Ordering::Relaxed) >= 4);
-    if need {
         full_scan(module, pool, func);
     }
 }
@@ -818,7 +802,6 @@ fn full_scan(module: &Module, pool: usize, mut func: usize) {
     }
 
     LAST_TOTAL.store(total as u64, Ordering::Relaxed);
-    FUNC_STALE.store(if func == 0 { u32::MAX as u64 } else { 0 }, Ordering::Relaxed);
     CAMS_SEEN.store(cams, Ordering::Relaxed);
     CAMS_LAST.store(KNOWN_N.load(Ordering::Relaxed), Ordering::Relaxed);
     SCANS.fetch_add(1, Ordering::Relaxed);
