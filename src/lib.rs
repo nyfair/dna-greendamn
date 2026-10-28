@@ -16,6 +16,7 @@ const TARGET_NAME: &str = "EM-Win64-Shipping.exe";
 const PLUGIN_NAME: &str = "dna-greendamn";
 const BUILD: &str = "2026-10-20";
 const TARGET_MODULE: &[u8] = TARGET_NAME.as_bytes();
+const LOG_NAME: &[u8] = "dna-greendamn.log".as_bytes();
 const TICK_MS: u32 = 2_500;
 const HEARTBEAT_MS: u64 = 60_000;
 
