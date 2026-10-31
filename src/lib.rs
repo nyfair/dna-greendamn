@@ -14,7 +14,7 @@ use xx::mem;
 
 const TARGET_NAME: &str = "EM-Win64-Shipping.exe";
 const PLUGIN_NAME: &str = "dna-greendamn";
-const BUILD: &str = "2026-10-20";
+const BUILD: &str = "2026-10-31";
 const TARGET_MODULE: &[u8] = TARGET_NAME.as_bytes();
 const LOG_NAME: &[u8] = "dna-greendamn.log".as_bytes();
 const TICK_MS: u32 = 2_500;
@@ -97,16 +97,10 @@ fn run() {
         if now.wrapping_sub(last_report) >= HEARTBEAT_MS {
             last_report = now;
             let mut b = Buf::new();
-            b.push_str("scan ");
-            b.push_u64(uncensor::walk_ms());
-            b.push_str("ms x");
-            b.push_u64(uncensor::scans());
-            b.push_str(", calls ");
-            b.push_u64(uncensor::cam_calls());
+            b.push_str("calls ");
+            b.push_u64(uncensor::dither_calls());
             b.push_str(", cameras ");
-            b.push_u64(uncensor::cams_last());
-            b.push_str(", known ");
-            b.push_u64(uncensor::known());
+            b.push_u64(uncensor::cameras());
             b.push_str(", func ");
             b.push_str(if uncensor::func_ok() { "ok" } else { "MISSING" });
             log::log_buf(&b);
